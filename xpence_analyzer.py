@@ -138,6 +138,14 @@ _DATE_H   = ["date","transaction date","trans date","posted date","value date"]
 _NAME_H   = ["description","transaction","merchant","name","narration","particulars","details","memo","payee"]
 _DEBIT_H  = ["debit","spent","amount","withdrawal","charge","payment out","dr","expense","paid"]
 _CREDIT_H = ["credit","deposit","payment in","cr","received","refund","inflow"]
+_ACCTYPE_H = ["account type","account_type","acct type","acct_type","card type",
+              "card_type","account","account name","account category"]
+
+# Default account type assumed when no account-type column is present in the
+# source data (see build_report()). Most personal-finance exports fed into
+# xPence originate from a credit-card statement, so "Credit" is the safest
+# assumption when nothing else is known.
+DEFAULT_ACCOUNT_TYPE = "Credit"
 
 def _best_match(candidates: list, hints: list) -> str | None:
     """Return the best matching candidate for any hint, or None."""
@@ -431,10 +439,11 @@ def _load_excel(filepath: str) -> tuple[pd.DataFrame, dict]:
         if df.shape[1] >= 2:
             cols = list(df.columns)
             col = {
-                "date":   _best_match(cols, _DATE_H),
-                "name":   _best_match(cols, _NAME_H),
-                "debit":  _best_match(cols, _DEBIT_H),
-                "credit": _best_match(cols, _CREDIT_H),
+                "date":         _best_match(cols, _DATE_H),
+                "name":         _best_match(cols, _NAME_H),
+                "debit":        _best_match(cols, _DEBIT_H),
+                "credit":       _best_match(cols, _CREDIT_H),
+                "account_type": _best_match(cols, _ACCTYPE_H),
             }
             if col["date"] and col["name"]:
                 return df, col
@@ -445,10 +454,13 @@ def _load_excel(filepath: str) -> tuple[pd.DataFrame, dict]:
         n = df.shape[1]
         df.columns = range(n)
         col = {
-            "date":   0,
-            "name":   1,
-            "debit":  2 if n > 2 else None,
-            "credit": 3 if n > 3 else None,
+            "date":         0,
+            "name":         1,
+            "debit":        2 if n > 2 else None,
+            "credit":       3 if n > 3 else None,
+            # The data-scrubbing tool (xpence_gui.py) writes account type as
+            # the 5th positional column when it can determine one.
+            "account_type": 4 if n > 4 else None,
         }
         return df, col
     except Exception as exc:
@@ -466,10 +478,11 @@ def _load_csv_inner(filepath: str) -> tuple[pd.DataFrame, dict]:
                 if df.shape[1] >= 3:
                     cols = list(df.columns)
                     col = {
-                        "date":   _best_match(cols, _DATE_H),
-                        "name":   _best_match(cols, _NAME_H),
-                        "debit":  _best_match(cols, _DEBIT_H),
-                        "credit": _best_match(cols, _CREDIT_H),
+                        "date":         _best_match(cols, _DATE_H),
+                        "name":         _best_match(cols, _NAME_H),
+                        "debit":        _best_match(cols, _DEBIT_H),
+                        "credit":       _best_match(cols, _CREDIT_H),
+                        "account_type": _best_match(cols, _ACCTYPE_H),
                     }
                     if col["date"] and col["name"]:
                         return df, col
@@ -510,6 +523,7 @@ def build_report(
     user_map:      dict | None = None,
     master_map:    dict | None = None,
     overrides_path: str | None = None,
+    account_type_filter: str | None = None,
 ) -> str:
     df = df_raw.copy()
     date_col = df[col["date"]]
@@ -523,10 +537,51 @@ def build_report(
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             df["_date"] = pd.to_datetime(date_col, errors="coerce", dayfirst=False)
-    df["_name"]   = df[col["name"]].astype(str).str.strip()
-    df["_debit"]  = clean_amount(df[col["debit"]]).clip(lower=0)  if col.get("debit")  else 0.0
-    df["_credit"] = clean_amount(df[col["credit"]]).clip(lower=0) if col.get("credit") else 0.0
+    df["_name"] = df[col["name"]].astype(str).str.strip()
+
+    # ── Debit / Credit ─────────────────────────────────────────────────────
+    # A transaction can arrive in one of two shapes:
+    #   (a) separate debit & credit columns (both already non-negative), or
+    #   (b) a single signed "amount" column, where a NEGATIVE value means the
+    #       transaction was a payment/refund credited to the account (this is
+    #       exactly what the xPence data-scrubbing tool emits for banks such
+    #       as TD/CIBC when no separate credit column exists).
+    # Feature: any negative amount that would otherwise be discarded is
+    # instead routed into "_credit" so it shows up under Credits / Payments
+    # rather than silently vanishing.
+    raw_debit = clean_amount(df[col["debit"]]) if col.get("debit") else pd.Series(0.0, index=df.index)
+    if col.get("credit"):
+        df["_credit"] = clean_amount(df[col["credit"]]).clip(lower=0)
+        df["_debit"]  = raw_debit.clip(lower=0)
+        # Even when a dedicated credit column exists, a stray negative value
+        # in the debit/amount column still represents money credited back —
+        # fold it into credits instead of dropping it.
+        df["_credit"] = df["_credit"] + (-raw_debit).clip(lower=0)
+    else:
+        df["_debit"]  = raw_debit.clip(lower=0)
+        df["_credit"] = (-raw_debit).clip(lower=0)
+
+    # ── Account type ───────────────────────────────────────────────────────
+    # Identified from the column the data-scrubbing tool produced. If that
+    # column isn't present in the source data at all, every transaction is
+    # assumed to be on a Credit account (the common case for xPence users).
+    account_type_detected = bool(col.get("account_type"))
+    if account_type_detected:
+        df["_account_type"] = (
+            df[col["account_type"]].astype(str).str.strip()
+            .replace({"": DEFAULT_ACCOUNT_TYPE, "nan": DEFAULT_ACCOUNT_TYPE, "None": DEFAULT_ACCOUNT_TYPE})
+        )
+    else:
+        df["_account_type"] = DEFAULT_ACCOUNT_TYPE
+
     df = df.dropna(subset=["_date"]).reset_index(drop=True)
+
+    # Optionally scope the whole report down to a single account type. Only
+    # meaningful when the source data actually carried an account-type
+    # column — filtering against an assumed/default value would be
+    # misleading since it wasn't verified from the data itself.
+    if account_type_filter and account_type_detected:
+        df = df[df["_account_type"].str.casefold() == account_type_filter.casefold()].reset_index(drop=True)
     df["_month"]    = df["_date"].dt.to_period("M").astype(str)
     df["_date_str"] = df["_date"].dt.strftime("%b %d, %Y")
     df["_date_iso"] = df["_date"].dt.strftime("%Y-%m-%d")
@@ -567,19 +622,21 @@ def build_report(
     # ── Serialise rows — to_dict("records") is faster than iterrows() ────
     rows = [
         {
-            "idx":      int(i),
-            "date":     r["_date_str"],
-            "date_iso": r["_date_iso"],
-            "name":     r["_name"],
-            "category": r["_category"],
-            "debit":    round(float(r["_debit"]),  2),
-            "credit":   round(float(r["_credit"]), 2),
-            "month":    r["_month"],
+            "idx":          int(i),
+            "date":         r["_date_str"],
+            "date_iso":     r["_date_iso"],
+            "name":         r["_name"],
+            "account_type": r["_account_type"],
+            "category":     r["_category"],
+            "debit":        round(float(r["_debit"]),  2),
+            "credit":       round(float(r["_credit"]), 2),
+            "month":        r["_month"],
         }
         for i, r in enumerate(df.to_dict("records"))
     ]
 
-    all_months = sorted(df["_month"].unique())
+    all_months     = sorted(df["_month"].unique())
+    account_types  = sorted(df["_account_type"].unique().tolist())
 
     # ── Active categories — preserve defined order ────────────────────────
     _custom_cat_names = {
@@ -841,6 +898,16 @@ def build_report(
             "generated":   datetime.now().strftime("%Y-%m-%d %H:%M"),
         },
         "overrides_path": overrides_path or "",
+        # ── Account type metadata ──────────────────────────────────────────
+        "account_types":          account_types,
+        "account_type_detected":  account_type_detected,
+        # Only baked in when the source data genuinely had an account-type
+        # column — an assumed/default type is never persisted as if it were
+        # a verified fact, since the same dates/merchants could belong to a
+        # different account type in other data.
+        "selected_account_type": (
+            account_type_filter if (account_type_filter and account_type_detected) else None
+        ),
     }, ensure_ascii=False)
 
     return HTML.replace("__DATA_JSON__", data_json)
@@ -1227,13 +1294,15 @@ tr:hover .flag-btn{color:var(--muted);border-color:var(--border)}
 /* list table */
 .sub-list-wrap{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;margin-bottom:1.8rem}
 .sub-list-head{display:grid;grid-template-columns:1fr 100px 110px 110px 110px 100px 130px;gap:0;padding:.6rem 1.2rem;background:#f8fafc;border-bottom:1px solid var(--border);font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
-.sub-list-row{display:grid;grid-template-columns:1fr 100px 110px 110px 110px 100px 130px;gap:0;padding:.75rem 1.2rem;border-bottom:1px solid var(--border);align-items:center;transition:background .12s}
+.sub-list-row{display:grid;grid-template-columns:1fr 100px 110px 110px 110px 100px 130px;gap:0;padding:.75rem 1.2rem;border-bottom:1px solid var(--border);align-items:start;transition:background .12s}
 .sub-list-row:last-child{border-bottom:none}
 .sub-list-row:hover{background:#f8fafc}
-.sub-row-name{font-size:.88rem;font-weight:600;color:var(--ink);display:flex;align-items:center;gap:.5rem;min-width:0}
-.sub-row-name-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sub-row-cat{font-size:.75rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sub-row-amt{font-size:.9rem;font-weight:700;color:var(--ink)}
+.sub-row-name{font-size:.88rem;font-weight:600;color:var(--ink);display:flex;align-items:flex-start;gap:.5rem;min-width:0}
+.sub-row-name-info{min-width:0;flex:1}
+.sub-row-name-text{white-space:normal;overflow-wrap:break-word;word-break:break-word;line-height:1.35}
+.sub-row-cat{font-size:.75rem;color:var(--muted);white-space:normal;overflow-wrap:break-word;display:flex;align-items:center;gap:.3rem;margin-top:.15rem}
+.sub-row-amt{font-size:.9rem;font-weight:700;color:var(--ink);text-align:right;padding-right:1rem}
+.sub-col-amt-head{text-align:right;padding-right:1rem}
 .sub-row-meta{font-size:.78rem;color:var(--ink2)}
 .sub-row-muted{font-size:.78rem;color:var(--muted)}
 .sub-pinned-dot{width:8px;height:8px;border-radius:50%;background:#16a34a;flex-shrink:0;display:inline-block}
@@ -1440,7 +1509,13 @@ tr:hover .flag-btn{color:var(--muted);border-color:var(--border)}
   <!-- ═══════════════ ALL SPENDING ═══════════════ -->
   <div class="view active" id="view-all">
     <div class="section-card">
-      <div class="section-head"><h2>Spending by Category — All Time</h2></div>
+      <div class="section-head">
+        <h2>Spending by Category — All Time</h2>
+        <select id="all-acct-filter" onchange="setAcctFilter(this.value)"
+                style="font-family:inherit;font-size:.82rem;font-weight:600;color:var(--ink2);
+                       padding:.4rem .7rem;border-radius:var(--radius-sm);border:1.5px solid var(--border);
+                       background:#fff;cursor:pointer"></select>
+      </div>
       <div class="section-body">
         <div class="cat-bar-list" id="all-cat-bars"></div>
       </div>
@@ -1471,7 +1546,7 @@ tr:hover .flag-btn{color:var(--muted);border-color:var(--border)}
       </div>
       <div style="padding:0;height:60vh;overflow-y:auto;overflow-x:auto">
           <table class="tx-table" style="min-width:600px">
-            <thead><tr><th class="sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortAllTx('date')">Date<span class="sort-icon" id="all-sort-icon-date">⇅</span></th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f">Transaction</th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f;width:36px;padding:0 .3rem"></th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f">Category</th><th class="amt sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortAllTx('debit')">Spent<span class="sort-icon" id="all-sort-icon-debit">⇅</span></th><th class="amt sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortAllTx('credit')">Credit<span class="sort-icon" id="all-sort-icon-credit">⇅</span></th></tr></thead>
+            <thead><tr><th class="sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortAllTx('date')">Date<span class="sort-icon" id="all-sort-icon-date">⇅</span></th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f">Account</th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f">Transaction</th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f;width:36px;padding:0 .3rem"></th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f">Category</th><th class="amt sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortAllTx('debit')">Spent<span class="sort-icon" id="all-sort-icon-debit">⇅</span></th><th class="amt sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortAllTx('credit')">Credit<span class="sort-icon" id="all-sort-icon-credit">⇅</span></th></tr></thead>
             <tbody id="all-tx-body"></tbody>
           </table>
       </div>
@@ -1518,7 +1593,7 @@ tr:hover .flag-btn{color:var(--muted);border-color:var(--border)}
       </div>
       <div style="padding:0;height:60vh;overflow-y:auto;overflow-x:auto">
           <table class="tx-table" style="min-width:600px">
-            <thead><tr><th class="sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortMonthTx('date')">Date<span class="sort-icon" id="month-sort-icon-date">⇅</span></th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f">Transaction</th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f;width:36px;padding:0 .3rem"></th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f">Category</th><th class="amt sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortMonthTx('debit')">Spent<span class="sort-icon" id="month-sort-icon-debit">⇅</span></th><th class="amt sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortMonthTx('credit')">Credit<span class="sort-icon" id="month-sort-icon-credit">⇅</span></th></tr></thead>
+            <thead><tr><th class="sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortMonthTx('date')">Date<span class="sort-icon" id="month-sort-icon-date">⇅</span></th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f">Account</th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f">Transaction</th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f;width:36px;padding:0 .3rem"></th><th style="position:sticky;top:0;z-index:2;background:#1e3a5f">Category</th><th class="amt sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortMonthTx('debit')">Spent<span class="sort-icon" id="month-sort-icon-debit">⇅</span></th><th class="amt sortable" style="position:sticky;top:0;z-index:2;background:#1e3a5f" onclick="sortMonthTx('credit')">Credit<span class="sort-icon" id="month-sort-icon-credit">⇅</span></th></tr></thead>
             <tbody id="month-tx-body"></tbody>
           </table>
       </div>
@@ -1591,6 +1666,21 @@ var _totalLineHidden = false;
 var qidSet = new Set(RAW.questionable.map(q => q.qid));
 var activeCategoryFilter = null;  // monthly tab category filter
 var activeAllCategoryFilter = null;  // all-spending tab category filter
+var activeAcctFilter = "All";  // all-spending tab account-type filter ("All" = no filter)
+
+function getAccountFilteredRows(rows) {
+  if (activeAcctFilter === "All") return rows;
+  return rows.filter(r => (r.account_type || "Credit") === activeAcctFilter);
+}
+
+function setAcctFilter(val) {
+  activeAcctFilter = val;
+  const rows = getEffectiveRows();
+  rebuildAllCatBars(rows);
+  buildOverTimeChart(rows);
+  const sb = document.getElementById("all-search-box");
+  filterAllTx(sb ? sb.value : "");
+}
 var catOverrides = {};  // {rowIdx: newCategoryString} for in-session reclassifications
 var qReviewed = false;  // true after Apply is clicked on the Review tab
 // flaggedIdxs replaced by _liveFlagged (signature-based, in user_overrides.json)
@@ -1937,6 +2027,20 @@ function _applyLiveOverrides(data, fromFile, onFileProtocol) {
   });
   sel.value = RAW.months[RAW.months.length - 1];
   renderMonthly(sel.value);
+
+  // Account-type filter for the All Spending tab
+  const acctSel = document.getElementById("all-acct-filter");
+  if (acctSel) {
+    const allOpt = document.createElement("option");
+    allOpt.value = "All"; allOpt.textContent = "All accounts";
+    acctSel.appendChild(allOpt);
+    (RAW.account_types || []).forEach(t => {
+      const o = document.createElement("option"); o.value = t; o.textContent = t;
+      acctSel.appendChild(o);
+    });
+    acctSel.value = "All";
+    acctSel.style.display = (RAW.account_types || []).length > 1 ? "" : "none";
+  }
 
   // Show review badge only for unresolved questionable rows
   const badge = document.getElementById("review-badge");
@@ -2995,6 +3099,7 @@ function buildFlaggedReclassifyPanel() {
 
 // ── ALL SPENDING ──────────────────────────────────────────────────────────
 function rebuildAllCatBars(rows) {
+  rows = getAccountFilteredRows(rows);
   const totals = computeCatTotals(rows);
   const grand  = Object.values(totals).reduce((a,b)=>a+b,0) || 1;
   const max_v  = Math.max(...Object.values(totals)) || 1;
@@ -3026,6 +3131,7 @@ function rebuildAllCatBars(rows) {
 }
 
 function buildAllTxTable(rows) {
+  rows = getAccountFilteredRows(rows);
   const sorted = sortRows(rows, allSort.col, allSort.dir);
   document.getElementById("all-tx-count").textContent = sorted.length + " transactions";
   document.getElementById("all-tx-body").innerHTML = sorted.map(r => txRow(r)).join("");
@@ -3068,6 +3174,7 @@ function updateAllClearBtn() {
 
 // ── Over-time line chart ──────────────────────────────────────────────────
 function buildOverTimeChart(rows) {
+  rows = getAccountFilteredRows(rows);
   const months = RAW.months;
   const cats   = getActiveCategories(rows);
   const filter = activeAllCategoryFilter;
@@ -3488,6 +3595,7 @@ function txRow(r) {
   const name   = r.name.length > 55 ? r.name.slice(0,55) + "\u2026" : r.name;
   return `<tr>
     <td style="white-space:nowrap;color:var(--muted);font-size:.8rem">${r.date}</td>
+    <td style="white-space:nowrap;font-size:.78rem;color:var(--ink2)"><span class="cat-tag" style="background:#334155">${r.account_type||'Credit'}</span></td>
     <td style="max-width:320px">${name}${reviewBadge}</td>
     <td style="width:36px;padding:0 .3rem;text-align:center">${flagBtn}</td>
     <td><span class="cat-tag" style="background:${RAW.cat_color_map[r.category]||'#64748b'}">${r.category}</span></td>
@@ -4203,13 +4311,6 @@ function buildSubscriptionsTab() {
       const isManual  = sub.isManual;
       const inData    = namesInData.has(sub.name);
 
-      // Dot indicator: green = confirmed, blue = manual, none = auto-detected
-      const dot = isPinned
-        ? (isManual
-            ? `<span class="sub-manual-dot" title="Manually added"></span>`
-            : `<span class="sub-pinned-dot" title="Confirmed"></span>`)
-        : "";
-
       const cat   = sub.category && sub.category !== "—" ? sub.category : "";
       const color = RAW.cat_color_map[sub.category] || "#64748b";
       const catPip = cat
@@ -4239,8 +4340,7 @@ function buildSubscriptionsTab() {
       return `
       <div class="sub-list-row" data-idx="${i}">
         <div class="sub-row-name">
-          ${dot}
-          <div>
+          <div class="sub-row-name-info">
             <div class="sub-row-name-text">${sub.name}</div>
             <div class="sub-row-cat">${catPip}${cat}</div>
           </div>
@@ -4258,7 +4358,7 @@ function buildSubscriptionsTab() {
     <div class="sub-list-wrap" id="sub-list-container">
       <div class="sub-list-head">
         <div>Merchant</div>
-        <div>Monthly</div>
+        <div class="sub-col-amt-head">Monthly</div>
         <div class="sub-col-day">Charge date</div>
         <div class="sub-col-first">First charged</div>
         <div>Last charged</div>
@@ -4436,6 +4536,10 @@ def main():
         "(default: user_overrides.json beside this script). "
         "Contains your personal overrides, custom categories, and subscriptions. "
         "Created automatically on first run."))
+    parser.add_argument("--account-type", "-a", help=(
+        "Only include transactions on this account type in the report "
+        "(e.g. Credit, Chequing, Savings). Only takes effect if the source "
+        "data has an identifiable account-type column — see README."))
     parser.add_argument("--xpr",       "-x", help=(
         "Path to a previously-saved .xpr report. Category overrides inside "
         "the xpr are pushed into user_overrides.json before generating the "
@@ -4489,7 +4593,8 @@ def main():
     # ── Step 5: build report (classification uses both maps) ─────────────
     print("Classifying transactions...")
     html = build_report(df, col, user_map=user_map, master_map=master_map,
-                        overrides_path=overrides_path)
+                        overrides_path=overrides_path,
+                        account_type_filter=args.account_type)
 
     out_path = args.output or "xpence_report.html"
     with open(out_path, "w", encoding="utf-8") as f:

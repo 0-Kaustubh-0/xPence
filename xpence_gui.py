@@ -117,7 +117,7 @@ def _read_xls(filepath: str) -> pd.DataFrame:
 
 # -- Bank parsers --------------------------------------------------------------
 
-def _parse_td(df: pd.DataFrame) -> pd.DataFrame:
+def _parse_td(df: pd.DataFrame, filepath: str = "") -> pd.DataFrame:
     """
     TD Bank — no header, 5 cols:
       0=date(MM/DD/YYYY)  1=description  2=debit  3=credit  4=balance(drop)
@@ -125,7 +125,11 @@ def _parse_td(df: pd.DataFrame) -> pd.DataFrame:
     Debit  (col 2) -> positive amount  (expense / purchase)
     Credit (col 3) -> negative amount  (payment / refund)
     Balance(col 4) -> dropped
+
+    Account type isn't exposed by this export format, so it's inferred from
+    the filename (falls back to "Credit" — see _infer_account_type()).
     """
+    acct_type = _infer_account_type(filepath)
     rows = []
     for _, r in df.iterrows():
         serial = _to_serial(str(r.iloc[0]).strip())
@@ -141,15 +145,19 @@ def _parse_td(df: pd.DataFrame) -> pd.DataFrame:
             amount = -credit     # payment/refund, make negative
         else:
             amount = 0.0
-        rows.append((serial, desc, round(amount, 2)))
-    return pd.DataFrame(rows, columns=["date_serial", "description", "amount"])
+        rows.append((serial, desc, round(amount, 2), acct_type))
+    return pd.DataFrame(rows, columns=["date_serial", "description", "amount", "account_type"])
 
 
-def _parse_cibc(df: pd.DataFrame) -> pd.DataFrame:
+def _parse_cibc(df: pd.DataFrame, filepath: str = "") -> pd.DataFrame:
     """
     CIBC — no header, 5 cols:
       0=date(MM/DD/YYYY)  1=description  2=debit  3=credit  4=card_no(PII,drop)
+
+    Account type isn't exposed by this export format, so it's inferred from
+    the filename (falls back to "Credit" — see _infer_account_type()).
     """
+    acct_type = _infer_account_type(filepath)
     rows = []
     for _, r in df.iterrows():
         serial = _to_serial(str(r.iloc[0]).strip())
@@ -165,8 +173,8 @@ def _parse_cibc(df: pd.DataFrame) -> pd.DataFrame:
             amount = -credit
         else:
             amount = 0.0
-        rows.append((serial, desc, round(amount, 2)))
-    return pd.DataFrame(rows, columns=["date_serial", "description", "amount"])
+        rows.append((serial, desc, round(amount, 2), acct_type))
+    return pd.DataFrame(rows, columns=["date_serial", "description", "amount", "account_type"])
 
 
 def _parse_wealthsimple(df: pd.DataFrame) -> pd.DataFrame:
@@ -178,9 +186,12 @@ def _parse_wealthsimple(df: pd.DataFrame) -> pd.DataFrame:
       activity_type       -> description fallback  (e.g. "MoneyMovement", "Interest")
       activity_sub_type   -> description primary   (e.g. "EFT", "E_TRFOUT")
       net_cash_amount     -> amount
+      account_type        -> account type (e.g. "Chequing", "Savings") — kept
+                             as-is rather than dropped, so the report can
+                             show/filter by account type.
 
     All other columns dropped (PII or irrelevant):
-      settlement_date, account_id, account_type, direction, symbol,
+      settlement_date, account_id, direction, symbol,
       name, currency, quantity, unit_price, commission
 
     Sign: Wealthsimple net_cash_amount:
@@ -215,6 +226,7 @@ def _parse_wealthsimple(df: pd.DataFrame) -> pd.DataFrame:
     amount_col  = gc("net_cash_amount", "amount")
     subtype_col = gc("activity_sub_type")
     type_col    = gc("activity_type")
+    accttype_col = gc("account_type")
 
     def label(sub, typ) -> str:
         for v in (sub, typ):
@@ -240,19 +252,23 @@ def _parse_wealthsimple(df: pd.DataFrame) -> pd.DataFrame:
         typ  = r.get(type_col)    if type_col    else None
         desc = label(sub, typ)
 
+        acct_raw = str(r.get(accttype_col)).strip() if accttype_col else ""
+        acct_type = acct_raw if acct_raw and acct_raw.lower() not in ("nan", "none", "") else _DEFAULT_ACCOUNT_TYPE
+
         # Negate: WS negative -> positive (expense); WS positive -> negative (credit)
-        rows.append((serial, desc, round(-amt, 2)))
+        rows.append((serial, desc, round(-amt, 2), acct_type))
 
-    return pd.DataFrame(rows, columns=["date_serial", "description", "amount"])
+    return pd.DataFrame(rows, columns=["date_serial", "description", "amount", "account_type"])
 
 
-def _parse_generic(df: pd.DataFrame) -> pd.DataFrame:
+def _parse_generic(df: pd.DataFrame, filepath: str = "") -> pd.DataFrame:
     """Best-effort parser for unknown banks with named headers."""
     _DATE_H   = ["date", "transaction date", "trans date", "posted date", "value date"]
     _NAME_H   = ["description", "transaction", "merchant", "narration",
                  "particulars", "details", "memo", "payee", "reference"]
     _DEBIT_H  = ["debit", "spent", "amount", "withdrawal", "charge", "dr", "expense"]
     _CREDIT_H = ["credit", "deposit", "payment in", "cr", "received", "refund"]
+    _ACCTYPE_H = ["account type", "account_type", "acct type", "card type", "account"]
 
     def best(candidates, hints):
         lmap = {c.lower().strip(): c for c in candidates if not _is_pii_col(c)}
@@ -269,10 +285,14 @@ def _parse_generic(df: pd.DataFrame) -> pd.DataFrame:
     df   = df[safe]
     cols = list(df.columns)
 
-    date_col   = best(cols, _DATE_H)   or (cols[0] if cols else None)
-    name_col   = best(cols, _NAME_H)   or (cols[1] if len(cols) > 1 else None)
-    debit_col  = best(cols, _DEBIT_H)  or (cols[2] if len(cols) > 2 else None)
-    credit_col = best(cols, _CREDIT_H) or (cols[3] if len(cols) > 3 else None)
+    date_col    = best(cols, _DATE_H)   or (cols[0] if cols else None)
+    name_col    = best(cols, _NAME_H)   or (cols[1] if len(cols) > 1 else None)
+    debit_col   = best(cols, _DEBIT_H)  or (cols[2] if len(cols) > 2 else None)
+    credit_col  = best(cols, _CREDIT_H) or (cols[3] if len(cols) > 3 else None)
+    accttype_col = best(cols, _ACCTYPE_H)
+    # If nothing in the file itself identifies the account type, fall back to
+    # a filename-based guess (see _infer_account_type()).
+    fallback_acct_type = _infer_account_type(filepath)
 
     rows = []
     for _, r in df.iterrows():
@@ -292,8 +312,10 @@ def _parse_generic(df: pd.DataFrame) -> pd.DataFrame:
             amount = -cv
         else:
             amount = 0.0
-        rows.append((serial, desc, round(amount, 2)))
-    return pd.DataFrame(rows, columns=["date_serial", "description", "amount"])
+        acct_raw = str(r.get(accttype_col)).strip() if accttype_col else ""
+        acct_type = acct_raw if acct_raw and acct_raw.lower() not in ("nan", "none", "") else fallback_acct_type
+        rows.append((serial, desc, round(amount, 2), acct_type))
+    return pd.DataFrame(rows, columns=["date_serial", "description", "amount", "account_type"])
 
 
 # -- Bank auto-detector --------------------------------------------------------
@@ -308,6 +330,26 @@ _BANK_FP = {
     "eqbank":       re.compile(r"eq[\s_-]?bank", re.I),
 }
 _WS_COLS = {"transaction_date", "account_id", "net_cash_amount", "activity_type"}
+
+# Default account type assumed for bank formats that don't expose one
+# explicitly (TD / CIBC / generic exports are almost always credit-card
+# statements downloaded from online banking).
+_DEFAULT_ACCOUNT_TYPE = "Credit"
+_ACCTYPE_FP = {
+    "Chequing": re.compile(r"chequ|checking", re.I),
+    "Savings":  re.compile(r"saving", re.I),
+    "Credit":   re.compile(r"credit", re.I),
+}
+
+
+def _infer_account_type(filepath: str) -> str:
+    """Best-effort account type guess from the filename, falling back to the
+    safe default ('Credit') when nothing in the name gives it away."""
+    name = os.path.basename(filepath)
+    for acct_type, pat in _ACCTYPE_FP.items():
+        if pat.search(name):
+            return acct_type
+    return _DEFAULT_ACCOUNT_TYPE
 
 
 def _detect_bank(filepath: str, df: pd.DataFrame) -> str:
@@ -366,20 +408,28 @@ def _read_raw(filepath: str) -> pd.DataFrame:
 
 def _parse(filepath: str, raw: pd.DataFrame) -> pd.DataFrame:
     bank = _detect_bank(filepath, raw)
-    if bank == "td":           return _parse_td(raw)
-    if bank == "cibc":         return _parse_cibc(raw)
+    if bank == "td":           return _parse_td(raw, filepath)
+    if bank == "cibc":         return _parse_cibc(raw, filepath)
     if bank == "wealthsimple": return _parse_wealthsimple(raw)
-    return _parse_generic(raw)
+    return _parse_generic(raw, filepath)
 
 
 def _write_xpence_xlsx(clean: pd.DataFrame, output_path: str) -> str:
-    """Write a cleaned DataFrame to the xPence filtered_data .xlsx format."""
+    """Write a cleaned DataFrame to the xPence filtered_data .xlsx format.
+
+    Columns (no header row, positional):
+      0=date_serial  1=description  2=amount(signed)  3=""(reserved)
+      4=account_type  — identified by the parser for this bank format,
+                        or the safe "Credit" default when it couldn't be.
+    """
     clean = clean[clean["date_serial"] > 0].copy()
+    acct_col = clean["account_type"].astype(str) if "account_type" in clean.columns else _DEFAULT_ACCOUNT_TYPE
     out = pd.DataFrame({
         0: clean["date_serial"].astype(int),
         1: clean["description"].astype(str),
         2: clean["amount"].round(2),
         3: "",
+        4: acct_col,
     })
     out.to_excel(output_path, index=False, header=False)
     return output_path
